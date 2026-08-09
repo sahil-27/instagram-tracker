@@ -1,0 +1,919 @@
+diff --git a/.gitignore b/.gitignore
+index 206f1b9..49b5289 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,9 @@
+ .env
++.venv/
+ __pycache__/
++*.pyc
++
+ instagram_tracking/*.json
+ instagram_tracking/history/
+ 
++test_*.py
+\ No newline at end of file
+diff --git a/database.py b/database.py
+new file mode 100644
+index 0000000..5981c9f
+--- /dev/null
++++ b/database.py
+@@ -0,0 +1,152 @@
++import os
++from datetime import datetime, timezone
++
++from dotenv import load_dotenv
++from pymongo import MongoClient
++
++load_dotenv()
++
++MONGODB_URI = os.getenv("MONGODB_URI")
++MONGODB_DATABASE = os.getenv("MONGODB_DATABASE")
++
++if not MONGODB_URI:
++    raise RuntimeError("MONGODB_URI is not configured")
++
++if not MONGODB_DATABASE:
++    raise RuntimeError("MONGODB_DATABASE is not configured")
++
++
++client = MongoClient(
++    MONGODB_URI,
++    serverSelectionTimeoutMS=5000
++)
++
++db = client[MONGODB_DATABASE]
++
++current_state_collection = db["current_state"]
++daily_events_collection = db["daily_events"]
++tracker_runs_collection = db["tracker_runs"]
++
++
++def get_current_state(target_username: str):
++    """
++    Get the latest follower/following state for a target account.
++    """
++
++    return current_state_collection.find_one(
++        {
++            "target_username": target_username
++        }
++    )
++
++
++def save_current_state(
++    target_username: str,
++    followers: list[dict],
++    following: list[dict]
++):
++    """
++    Replace the current state for a target account.
++    """
++
++    state = {
++        "target_username": target_username,
++        "followers": followers,
++        "following": following,
++        "follower_count": len(followers),
++        "following_count": len(following),
++        "updated_at": datetime.now(timezone.utc)
++    }
++
++    current_state_collection.update_one(
++        {
++            "target_username": target_username
++        },
++        {
++            "$set": state
++        },
++        upsert=True
++    )
++
++
++def save_daily_events(
++    target_username: str,
++    followers_new: list[dict],
++    followers_lost: list[dict],
++    following_new: list[dict],
++    following_lost: list[dict]
++):
++    """
++    Save all changes detected during one tracking run.
++    """
++
++    now = datetime.now(timezone.utc)
++    date = now.strftime("%Y-%m-%d")
++
++    daily_event = {
++        "target_username": target_username,
++        "date": date,
++        "followers": {
++            "new": followers_new,
++            "lost": followers_lost,
++            "new_count": len(followers_new),
++            "lost_count": len(followers_lost)
++        },
++        "following": {
++            "new": following_new,
++            "lost": following_lost,
++            "new_count": len(following_new),
++            "lost_count": len(following_lost)
++        },
++        "created_at": now
++    }
++
++    daily_events_collection.update_one(
++        {
++            "target_username": target_username,
++            "date": date
++        },
++        {
++            "$set": daily_event
++        },
++        upsert=True
++    )
++
++def has_successful_run_today(target_username: str) -> bool:
++    """
++    Check whether this target has already been successfully
++    polled today (UTC).
++    """
++
++    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
++
++    return tracker_runs_collection.find_one(
++        {
++            "target_username": target_username,
++            "date": today,
++            "status": "success"
++        }
++    ) is not None
++
++def save_successful_run(target_username: str):
++    """
++    Record a successful tracker execution.
++    """
++
++    now = datetime.now(timezone.utc)
++
++    tracker_runs_collection.update_one(
++        {
++            "target_username": target_username,
++            "date": now.strftime("%Y-%m-%d")
++        },
++        {
++            "$set": {
++                "target_username": target_username,
++                "date": now.strftime("%Y-%m-%d"),
++                "status": "success",
++                "completed_at": now
++            }
++        },
++        upsert=True
++    )
+diff --git a/main.py b/main.py
+index 423ce6d..dbf2198 100644
+--- a/main.py
++++ b/main.py
+@@ -1,142 +1,633 @@
+-import instaloader
+-import json
+ import os
+ import argparse
+-from datetime import datetime
+-from typing import List
++
++import instaloader
++from instaloader.exceptions import TooManyRequestsException
+ from dotenv import load_dotenv
+ 
+-try:
+-    from pyfiglet import Figlet
+-    f = Figlet(font='cybermedium')
+-    print(f.renderText('ig-tracker'))
+-except ImportError:
+-    print("\n=== IG TRACKER ===\n")
++from database import (
++    get_current_state,
++    save_current_state,
++    save_daily_events,
++    has_successful_run_today,
++    save_successful_run,
++)
+ 
+ 
+-# Load environment variables
++# ---------------------------------------------------------
++# Configuration
++# ---------------------------------------------------------
++
+ load_dotenv()
++
+ TARGET_USERNAME = os.getenv("TARGET_USERNAME")
+ YOUR_IG_USERNAME = os.getenv("YOUR_IG_USERNAME")
+ 
+-DATA_DIR = 'instagram_tracking'
+-HISTORY_DIR = os.path.join(DATA_DIR, 'history')
+-FOLLOWERS_FILE = os.path.join(DATA_DIR, 'followers.json')
+-FOLLOWING_FILE = os.path.join(DATA_DIR, 'following.json')
++INSTAGRAM_SESSION_FILE = os.getenv(
++    "INSTAGRAM_SESSION_FILE"
++)
++
++
++# ---------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------
++
++def compare_users(
++    current: list[dict],
++    previous: list[dict]
++):
++    """
++    Compare two Instagram user lists using Instagram user IDs.
++
++    Returns:
++        added: Users present in current but not previous.
++        removed: Users present in previous but not current.
++    """
++
++    current_by_id = {
++        user["id"]: user
++        for user in current
++    }
+ 
+-def save_json(filename: str, data: List[str]):
+-    with open(filename, 'w') as f:
+-        json.dump(sorted(data), f, indent=2)
++    previous_by_id = {
++        user["id"]: user
++        for user in previous
++    }
+ 
+-def load_json(filename: str) -> List[str]:
+-    if os.path.exists(filename):
+-        with open(filename) as f:
+-            return json.load(f)
+-    return []
++    current_ids = set(current_by_id.keys())
++    previous_ids = set(previous_by_id.keys())
+ 
+-def linkify(users: List[str]) -> List[str]:
+-    return [f"https://instagram.com/{u}" for u in sorted(users)]
++    added_ids = current_ids - previous_ids
++    removed_ids = previous_ids - current_ids
++
++    added = [
++        current_by_id[user_id]
++        for user_id in added_ids
++    ]
++
++    removed = [
++        previous_by_id[user_id]
++        for user_id in removed_ids
++    ]
++
++    added.sort(
++        key=lambda user: user["username"]
++    )
++
++    removed.sort(
++        key=lambda user: user["username"]
++    )
+ 
+-def compare(new: List[str], old: List[str]):
+-    added = sorted(list(set(new) - set(old)))
+-    removed = sorted(list(set(old) - set(new)))
+     return added, removed
+ 
+-def display_and_log(label: str, added: List[str], removed: List[str], log_lines: List[str]):
++
++def print_changes(
++    label: str,
++    added: list[dict],
++    removed: list[dict]
++):
++    """
++    Print detected changes to the terminal.
++    """
++
+     print(f"\n📈 {label.upper()} CHANGES")
+-    print("➕ Added:", "\n  " + "\n  ".join(linkify(added)) if added else "None")
+-    print("➖ Removed:", "\n  " + "\n  ".join(linkify(removed)) if removed else "None")
+-
+-    log_lines.append(f"## {label.capitalize()} changes")
+-    log_lines.append(f"**Added ({len(added)}):**")
+-    log_lines.extend([f"- {u}" for u in linkify(added)] or ["- None"])
+-    log_lines.append(f"**Removed ({len(removed)}):**")
+-    log_lines.extend([f"- {u}" for u in linkify(removed)] or ["- None"])
+-    log_lines.append("")
+-
+-def write_changelog(log_lines: List[str], timestamp: str):
+-    os.makedirs(HISTORY_DIR, exist_ok=True)
+-    filename = os.path.join(HISTORY_DIR, f"{timestamp}_{TARGET_USERNAME}.md")
+-    with open(filename, "w") as f:
+-        f.write("\n".join(log_lines))
+-    print(f"\n📝 Log saved to: {filename}")
+ 
+-def main():
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument('--dry-run', action='store_true', help="Preview changes without saving")
+-    args = parser.parse_args()
++    print(f"➕ Added ({len(added)}):")
+ 
+-    if not TARGET_USERNAME or not YOUR_IG_USERNAME:
+-        print("❌ Error: Please set TARGET_USERNAME and YOUR_IG_USERNAME in your .env file.")
+-        return
++    if added:
++        for user in added:
++            print(f"   @{user['username']}")
++    else:
++        print("   None")
++
++    print(f"➖ Removed ({len(removed)}):")
++
++    if removed:
++        for user in removed:
++            print(f"   @{user['username']}")
++    else:
++        print("   None")
++
++
++# ---------------------------------------------------------
++# Instagram Session
++# ---------------------------------------------------------
++
++def load_instagram_session():
++    """
++    Load the existing Instaloader session from the
++    configured session file.
++
++    Local:
++        ~/.config/instaloader/session-username
++
++    Render:
++        /etc/secrets/session-username
++    """
++
++    if not INSTAGRAM_SESSION_FILE:
++        raise RuntimeError(
++            "INSTAGRAM_SESSION_FILE is not configured"
++        )
++
++    if not os.path.isfile(INSTAGRAM_SESSION_FILE):
++        raise RuntimeError(
++            "Instagram session file not found: "
++            f"{INSTAGRAM_SESSION_FILE}"
++        )
+ 
+-    os.makedirs(DATA_DIR, exist_ok=True)
+     loader = instaloader.Instaloader()
+ 
+-    print("🔐 Loading saved session...")
++    print(
++        "🔐 Loading saved Instagram session..."
++    )
++
+     try:
+-        loader.load_session_from_file(YOUR_IG_USERNAME)
+-        print(f"✅ Logged in as @{YOUR_IG_USERNAME}")
++        loader.load_session_from_file(
++            YOUR_IG_USERNAME,
++            INSTAGRAM_SESSION_FILE
++        )
++
++        print(
++            f"✅ Logged in as @{YOUR_IG_USERNAME}"
++        )
++
++    except TooManyRequestsException:
++        raise RuntimeError(
++            "Instagram rate limit detected while "
++            "loading the session. Stopping immediately."
++        )
++
+     except Exception as e:
+-        print(f"❌ Failed to load session: {e}")
+-        return
++        raise RuntimeError(
++            f"Failed to load Instagram session: {e}"
++        )
++
++    return loader
++
++
++# ---------------------------------------------------------
++# Instagram Data
++# ---------------------------------------------------------
++
++def fetch_instagram_data(loader):
++    """
++    Fetch the target profile, followers and following.
++
++    If any request fails, the entire tracking run is
++    aborted.
++
++    A failed request is NEVER treated as an empty list.
++    """
++
++    print(
++        f"\n📦 Fetching profile for "
++        f"@{TARGET_USERNAME}..."
++    )
+ 
+-    print(f"\n📦 Fetching profile for @{TARGET_USERNAME}...")
+     try:
+-        profile = instaloader.Profile.from_username(loader.context, TARGET_USERNAME)
+-        print(f"✅ Profile found: {profile.full_name or TARGET_USERNAME}")
++        profile = instaloader.Profile.from_username(
++            loader.context,
++            TARGET_USERNAME
++        )
++
++        print(
++            f"✅ Profile found: "
++            f"{profile.full_name or TARGET_USERNAME}"
++        )
++
++    except TooManyRequestsException:
++        raise RuntimeError(
++            "Instagram rate limit detected while "
++            "loading the target profile. "
++            "Stopping immediately."
++        )
++
+     except Exception as e:
+-        print(f"❌ Could not load profile: {e}")
+-        return
++        raise RuntimeError(
++            f"Could not load profile: {e}"
++        )
++
++    # -----------------------------------------------------
++    # Followers
++    # -----------------------------------------------------
++
++    print("\n📥 Getting followers...")
++
++    try:
++        followers = []
++
++        for follower in profile.get_followers():
++            followers.append({
++                "id": str(follower.userid),
++                "username": follower.username
++            })
++
++        print(
++            f"✅ Retrieved {len(followers)} followers"
++        )
++
++    except TooManyRequestsException:
++        raise RuntimeError(
++            "Instagram rate limit detected while "
++            "fetching followers. "
++            "Stopping immediately."
++        )
++
++    except Exception as e:
++        raise RuntimeError(
++            f"Could not fetch followers: {e}"
++        )
++
++    # -----------------------------------------------------
++    # Following
++    # -----------------------------------------------------
++
++    print("\n📥 Getting following...")
++
++    try:
++        following = []
++
++        for followee in profile.get_followees():
++            following.append({
++                "id": str(followee.userid),
++                "username": followee.username
++            })
++
++        print(
++            f"✅ Retrieved {len(following)} following"
++        )
++
++    except TooManyRequestsException:
++        raise RuntimeError(
++            "Instagram rate limit detected while "
++            "fetching following. "
++            "Stopping immediately."
++        )
++
++    except Exception as e:
++        raise RuntimeError(
++            f"Could not fetch following: {e}"
++        )
++
++    return profile, followers, following
++
++
++# ---------------------------------------------------------
++# Main
++# ---------------------------------------------------------
++
++def main():
++
++    parser = argparse.ArgumentParser()
++
++    parser.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="Preview changes without saving to MongoDB"
++    )
++
++    args = parser.parse_args()
++
++    # -----------------------------------------------------
++    # Validate configuration
++    # -----------------------------------------------------
++
++    if not TARGET_USERNAME:
++        raise RuntimeError(
++            "TARGET_USERNAME is not configured"
++        )
++
++    if not YOUR_IG_USERNAME:
++        raise RuntimeError(
++            "YOUR_IG_USERNAME is not configured"
++        )
++
++    print("==========================================")
++    print("          INSTAGRAM TRACKER")
++    print("==========================================")
++
++    print(
++        f"Target: @{TARGET_USERNAME}"
++    )
++
++    print(
++        f"Instagram account: @{YOUR_IG_USERNAME}"
++    )
++
++    # -----------------------------------------------------
++    # Daily safety check
++    # -----------------------------------------------------
++
++    if not args.dry_run:
++
++        print(
++            "\n🔍 Checking today's tracker status..."
++        )
++
++        if has_successful_run_today(
++            TARGET_USERNAME
++        ):
++
++            print(
++                "⏭️ Tracker has already run "
++                "successfully today."
++            )
++
++            print(
++                "🚫 No Instagram requests will be made."
++            )
++
++            return
++
++        print(
++            "✅ No successful run found for today."
++        )
++
++    else:
++
++        print(
++            "\n🧪 Dry-run mode: daily safety "
++            "check skipped."
++        )
++
++    # -----------------------------------------------------
++    # Load Instagram session
++    # -----------------------------------------------------
+ 
+     try:
+-        print("📥 Getting followers...")
+-        current_followers = [f.username for f in profile.get_followers()]
++
++        loader = load_instagram_session()
++
+     except Exception as e:
+-        print(f"⚠️ Could not fetch followers: {e}")
+-        current_followers = []
++
++        print(
++            "\n❌ Instagram session error."
++        )
++
++        print(
++            f"Reason: {e}"
++        )
++
++        return
++
++    # -----------------------------------------------------
++    # Fetch current Instagram state
++    # -----------------------------------------------------
+ 
+     try:
+-        print("📥 Getting following...")
+-        current_following = [f.username for f in profile.get_followees()]
++
++        (
++            profile,
++            current_followers,
++            current_following
++        ) = fetch_instagram_data(loader)
++
+     except Exception as e:
+-        print(f"⚠️ Could not fetch following: {e}")
+-        current_following = []
+ 
+-    if not current_followers and not current_following:
+-        print("⚠️ No follower/following data retrieved. Aborting comparison.")
++        print(
++            "\n❌ Tracking run failed."
++        )
++
++        print(
++            f"Reason: {e}"
++        )
++
++        print(
++            "\n🚫 Nothing was saved to MongoDB."
++        )
++
++        return
++
++    # -----------------------------------------------------
++    # Get previous state
++    # -----------------------------------------------------
++
++    print(
++        "\n🔍 Loading previous state "
++        "from MongoDB..."
++    )
++
++    previous_state = get_current_state(
++        TARGET_USERNAME
++    )
++
++    # -----------------------------------------------------
++    # First run
++    # -----------------------------------------------------
++
++    if previous_state is None:
++
++        print(
++            "\n🆕 No previous state found."
++        )
++
++        print(
++            "This is the first run, so this "
++            "will become the baseline."
++        )
++
++        if args.dry_run:
++
++            print(
++                "\n🚫 Dry run: baseline "
++                "was not saved."
++            )
++
++            return
++
++        try:
++
++            save_current_state(
++                TARGET_USERNAME,
++                current_followers,
++                current_following
++            )
++
++            save_daily_events(
++                TARGET_USERNAME,
++                [],
++                [],
++                [],
++                []
++            )
++
++            save_successful_run(
++                TARGET_USERNAME
++            )
++
++            print(
++                "\n✅ Initial state "
++                "saved to MongoDB."
++            )
++
++            print(
++                "✅ Tracker run marked "
++                "as successful."
++            )
++
++        except Exception as e:
++
++            print(
++                "\n❌ Failed to save "
++                "initial state."
++            )
++
++            print(
++                f"Reason: {e}"
++            )
++
++            print(
++                "\n⚠️ Run was NOT marked "
++                "as successful."
++            )
++
+         return
+ 
+-    print("💾 Comparing with last saved snapshot...")
+-    old_followers = load_json(FOLLOWERS_FILE)
+-    old_following = load_json(FOLLOWING_FILE)
++    # -----------------------------------------------------
++    # Compare
++    # -----------------------------------------------------
++
++    print(
++        "\n🔍 Comparing with "
++        "previous state..."
++    )
++
++    previous_followers = previous_state.get(
++        "followers",
++        []
++    )
++
++    previous_following = previous_state.get(
++        "following",
++        []
++    )
++
++    (
++        new_followers,
++        lost_followers
++    ) = compare_users(
++        current_followers,
++        previous_followers
++    )
++
++    (
++        new_following,
++        unfollowed
++    ) = compare_users(
++        current_following,
++        previous_following
++    )
++
++    # -----------------------------------------------------
++    # Display changes
++    # -----------------------------------------------------
+ 
+-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+-    log_lines = [f"# Instagram Tracker Report – {timestamp}", ""]
++    print_changes(
++        "Followers",
++        new_followers,
++        lost_followers
++    )
+ 
+-    new_followers, lost_followers = compare(current_followers, old_followers)
+-    new_following, unfollowed = compare(current_following, old_following)
++    print_changes(
++        "Following",
++        new_following,
++        unfollowed
++    )
+ 
+-    display_and_log("followers", new_followers, lost_followers, log_lines)
+-    display_and_log("following", new_following, unfollowed, log_lines)
++    print("\n📊 Daily Summary")
+ 
+-    print("\n📊 Summary:")
+-    print(f"👥 Followers: +{len(new_followers)}, -{len(lost_followers)}, Net: {len(new_followers) - len(lost_followers)}")
+-    print(f"➡️ Following: +{len(new_following)}, -{len(unfollowed)}, Net: {len(new_following) - len(unfollowed)}")
++    print(
++        f"👥 Followers: "
++        f"+{len(new_followers)}, "
++        f"-{len(lost_followers)}, "
++        f"Net: "
++        f"{len(new_followers) - len(lost_followers)}"
++    )
+ 
+-    log_lines.append("## Summary")
+-    log_lines.append(f"- Followers: +{len(new_followers)}, -{len(lost_followers)}, Net: {len(new_followers) - len(lost_followers)}")
+-    log_lines.append(f"- Following: +{len(new_following)}, -{len(unfollowed)}, Net: {len(new_following) - len(unfollowed)}")
+-    log_lines.append("")
++    print(
++        f"➡️ Following: "
++        f"+{len(new_following)}, "
++        f"-{len(unfollowed)}, "
++        f"Net: "
++        f"{len(new_following) - len(unfollowed)}"
++    )
++
++    # -----------------------------------------------------
++    # Save
++    # -----------------------------------------------------
+ 
+     if args.dry_run:
+-        print("\n🚫 Dry run mode: no files saved.")
++
++        print(
++            "\n🚫 Dry run: nothing saved "
++            "to MongoDB."
++        )
++
+     else:
+-        save_json(FOLLOWERS_FILE, current_followers)
+-        save_json(FOLLOWING_FILE, current_following)
+-        write_changelog(log_lines, timestamp)
+-        print(f"\n✅ Tracking complete! Data saved to '{DATA_DIR}/' at {timestamp}")
+ 
+-if __name__ == "__main__":
+-    main()
++        try:
++
++            save_daily_events(
++                TARGET_USERNAME,
++                new_followers,
++                lost_followers,
++                new_following,
++                unfollowed
++            )
++
++            save_current_state(
++                TARGET_USERNAME,
++                current_followers,
++                current_following
++            )
++
++            save_successful_run(
++                TARGET_USERNAME
++            )
++
++            print(
++                "\n✅ Daily changes "
++                "saved to MongoDB."
++            )
++
++            print(
++                "✅ Tracker run marked "
++                "as successful."
++            )
++
++        except Exception as e:
+ 
++            print(
++                "\n❌ Failed to save "
++                "tracking data."
++            )
++
++            print(
++                f"Reason: {e}"
++            )
++
++            print(
++                "\n⚠️ The run was NOT "
++                "marked as successful."
++            )
++
++    print(
++        "\n=========================================="
++    )
++
++    print(
++        "              TRACKING DONE"
++    )
++
++    print(
++        "=========================================="
++    )
++
++
++# ---------------------------------------------------------
++# Entry Point
++# ---------------------------------------------------------
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/requirements.txt b/requirements.txt
+index 8a0aee3..9dc536c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -4,5 +4,6 @@ idna==3.10
+ instaloader==4.14.1
+ pyfiglet==1.0.3
+ python-dotenv==1.1.1
++pymongo==4.17.0
+ requests==2.32.4
+ urllib3==2.5.0
